@@ -14,7 +14,9 @@ include(helpers)
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+find_package(LibDataChannel REQUIRED)
+find_package(jsoncpp REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs LibDataChannel::LibDataChannel jsoncpp_lib)
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
@@ -34,6 +36,20 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.cpp src/comfystream_client.cpp)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# Set Ubuntu-specific install paths
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/etc/os-release")
+  file(READ "/etc/os-release" OS_RELEASE_CONTENT)
+  if(OS_RELEASE_CONTENT MATCHES "Ubuntu")
+    set(LIB_INSTALL_DIR "/usr/lib/x86_64-linux-gnu/obs-plugins")
+    set(SHARE_INSTALL_DIR "/usr/share/obs/obs-plugins/obs-comfystream")
+  endif()
+endif()
+
+# Install plugin and data files
+install(TARGETS ${CMAKE_PROJECT_NAME}
+        LIBRARY DESTINATION "${LIB_INSTALL_DIR}")
+install(DIRECTORY data/ DESTINATION "${SHARE_INSTALL_DIR}/data")
