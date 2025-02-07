@@ -18,6 +18,7 @@ private:
 
     std::string serverUrl;
     std::shared_ptr<rtc::PeerConnection> pc;
+    std::shared_ptr<rtc::Track> videoTrack;
 };
 
 #endif

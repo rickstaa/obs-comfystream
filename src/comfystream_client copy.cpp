@@ -12,10 +12,6 @@ using json = nlohmann::json;
 const int SERVER_TIMEOUT = 60;           // seconds
 const size_t MAX_RTP_PACKET_SIZE = 1024; // bytes
 
-std::atomic<uint16_t> global_seq_number(0);  // 🔹 Global sequence number (increments per packet)
-std::atomic<uint32_t> global_timestamp(0);   // 🔹 Global timestamp (increments per frame)
-const uint32_t RTP_CLOCK_RATE = 90000;       // RTP uses a 90KHz clock
-
 // Default media pass-through pipeline prompt for the AI WebRTC Server.
 const std::string defaultPipelinePrompt =
 	R"({ "12": { "inputs": { "image": "sampled_frame.jpg", "upload": "image" }, "class_type": "LoadImage", "_meta": { "title": "Load Image" } }, "13": { "inputs": { "images": ["12", 0] }, "class_type": "PreviewImage", "_meta": { "title": "Preview Image" } } })";
@@ -202,6 +198,8 @@ void ComfyStreamClient::send_frame(obs_source_frame *frame)
 	// Fragment the frame into smaller packets.
 	size_t totalSize = videoFrame.size();
 	size_t offset = 0;
+	static uint16_t sequenceNumber = 0;
+	static uint32_t timestamp = 0;
 	const uint32_t ssrc = 42;
 	while (offset < totalSize) {
 		size_t chunkSize = std::min<size_t>(MAX_RTP_PACKET_SIZE, totalSize - offset);
@@ -210,8 +208,8 @@ void ComfyStreamClient::send_frame(obs_source_frame *frame)
 		// Create RTP header.
 		rtc::RtpHeader rtpHeader;
 		rtpHeader.setPayloadType(102);
-		rtpHeader.setSeqNumber(global_seq_number++);
-		rtpHeader.setTimestamp(global_timestamp);
+		rtpHeader.setSeqNumber(sequenceNumber++);
+		rtpHeader.setTimestamp(timestamp);
 		rtpHeader.setSsrc(ssrc);
 
 		// Combine RTP header and chunk.
@@ -229,7 +227,7 @@ void ComfyStreamClient::send_frame(obs_source_frame *frame)
 		}
 
 		offset += chunkSize;
-		global_timestamp += chunkSize;
+		timestamp += chunkSize; // Increment timestamp by chunk size (adjust as needed).
 	}
 }
 
