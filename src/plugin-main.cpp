@@ -25,7 +25,7 @@ static void *filter_create(obs_data_t * /*settings*/, obs_source_t *source)
 {
     struct filter_data *filter = (struct filter_data *)bzalloc(sizeof(struct filter_data));
     filter->source = source;
-    filter->client = new ComfyStreamClient("https://0.0.0.0:8888");
+    filter->client = new ComfyStreamClient();
     return filter;
 }
 

@@ -2,113 +2,190 @@
 #include <rtc/rtc.hpp>
 #include <obs-module.h>
 #include <iostream>
-#include <json/json.h>
+#include <nlohmann/json.hpp>
 #include <httplib.h>
 #include <plugin-support.h>
 
 using namespace std;
+using json = nlohmann::json;
 
-// Function to send offer to the Python server
-Json::Value sendOfferToServer(const std::string& offerSdp, const std::string& serverUrl) {
-    httplib::Client client(serverUrl.c_str());
+const int SERVER_TIMEOUT = 60; // seconds
 
-    Json::Value requestBody;
-    requestBody["offer"]["sdp"] = offerSdp;
-    requestBody["offer"]["type"] = "offer";
-    requestBody["prompt"] = "test-prompt";  // Example additional parameter
+// Default media pass-through pipeline prompt for the AI WebRTC Server.
+const std::string defaultPipelinePrompt =
+	R"({ "12": { "inputs": { "image": "sampled_frame.jpg", "upload": "image" }, "class_type": "LoadImage", "_meta": { "title": "Load Image" } }, "13": { "inputs": { "images": ["12", 0] }, "class_type": "PreviewImage", "_meta": { "title": "Preview Image" } } })";
 
-    Json::StreamWriterBuilder writer;
-    std::string requestBodyStr = Json::writeString(writer, requestBody);
+/**
+ * Send the SDP offer to the ComfyStream server.
+ * @param sdp The SDP offer to send.
+ * @return The server response.
+ */
+std::string ComfyStreamClient::sendSDPToServer(const std::string &sdp)
+{
+	httplib::Client cli(serverUrl);
 
-    auto res = client.Post("/offer", requestBodyStr, "application/json");
+	json request;
+	request["offer"] = {{"sdp", sdp}, {"type", "offer"}};
+	json prompt = json::parse(defaultPipelinePrompt);
+	request["prompt"] = prompt;
 
-    if (res && res->status == 200) {
-        Json::CharReaderBuilder reader;
-        Json::Value response;
-        std::string errors;
-        std::istringstream s(res->body);
+	auto res = cli.Post("/offer", request.dump(), "application/json");
+	return (res && res->status == 200) ? res->body : "";
+}
 
-        if (!Json::parseFromStream(reader, s, &response, &errors)) {
-            throw std::runtime_error("Failed to parse JSON response: " + errors);
-        }
+/**
+ * Detach all handlers and clean up the remote connection.
+ */
+void ComfyStreamClient::cleanupConnection()
+{
+    if (pc) {
+        obs_log(LOG_INFO, "Cleaning up WebRTC peer connection");
 
-        return response;
-    } else {
-        throw std::runtime_error("Failed to send offer to server");
+        // Detach handlers.
+        pc->onLocalDescription(nullptr);
+        pc->onStateChange(nullptr);
+        pc->onLocalCandidate(nullptr);
+        pc->onIceStateChange(nullptr);
+        pc->onSignalingStateChange(nullptr);
+        pc->onGatheringStateChange(nullptr);
+        pc->onTrack(nullptr);
+
+        // Close the peer connection.
+        pc->close();
+        obs_log(LOG_INFO, "WebRTC peer connection closed");
     }
 }
 
-// Constructor
-// Constructor
-ComfyStreamClient::ComfyStreamClient(const std::string& serverUrl) : serverUrl(serverUrl) {
-    // Create WebRTC peer connection.
-    rtc::Configuration config;
-    auto pc = std::make_shared<rtc::PeerConnection>(config);
-    obs_log(LOG_INFO, "Created WebRTC peer connection");
+/**
+ * ComfyStream client constructor.
+ * 
+ * @param url The ComfyStream server URL.
+ */
+ComfyStreamClient::ComfyStreamClient(const std::string &url) : serverUrl(url)
+{
+	rtc::InitLogger(rtc::LogLevel::Info);
 
-    // Create data channel.
-    auto dc = pc->createDataChannel("control");
-    dc->onOpen([]() { std::cout << "Data channel opened\n"; });
+	// Create WebRTC peer connection.
+	obs_log(LOG_INFO, "Creating WebRTC peer connection");
+	rtc::Configuration config;
+	config.iceServers.emplace_back("stun:stun.l.google.com:19302");
+	pc = std::make_shared<rtc::PeerConnection>(config);
 
-    // Correctly handle std::variant for messages
-    dc->onMessage([](auto data) {
-        std::visit([](auto&& arg) {
-            if constexpr (std::is_same_v<std::decay_t<decltype(arg)>, std::string>) {
-                std::cout << "Message received: " << arg << "\n";
-            } else {
-                std::cout << "Binary message received\n";
-            }
-        }, data);
-    });
+	// Create WebRTC handlers.
+	pc->onLocalDescription([this](rtc::Description sdp) {
+		obs_log(LOG_DEBUG, "Generated SDP Offer:\n%s", std::string(sdp).c_str());
+	});
+	pc->onStateChange([](rtc::PeerConnection::State state) {
+		obs_log(LOG_DEBUG, "[PeerConnection State Change] New state: %d", static_cast<int>(state));
+	});
+	pc->onLocalCandidate([](rtc::Candidate candidate) {
+		obs_log(LOG_DEBUG, "[Local Candidate] %s", candidate.candidate().c_str());
+	});
+	pc->onIceStateChange([](rtc::PeerConnection::IceState state) {
+		obs_log(LOG_DEBUG, "[ICE State Change] New state: %d", static_cast<int>(state));
+	});
+	pc->onSignalingStateChange([](rtc::PeerConnection::SignalingState state) {
+		obs_log(LOG_DEBUG, "[Signaling State Change] New state: %d", static_cast<int>(state));
+	});
 
-    obs_log(LOG_INFO, "Created data channel");
+	// Connect to ComfyStream WebRTC server.
+	pc->onGatheringStateChange([this](rtc::PeerConnection::GatheringState state) {
+		// Use non-trickling ICE.
+		if (state == rtc::PeerConnection::GatheringState::Complete) {
+			obs_log(LOG_DEBUG, "All ICE candidates have been gathered");
 
-    // Set up offer and handle answer
-    pc->onLocalDescription([&, pc](rtc::Description desc) {
-        std::cout << "Generated local SDP offer:\n" << std::string(desc) << "\n";
+			// Retrieve local description and send it to the server.
+			auto description = pc->localDescription();
+			if (!description) {
+				obs_log(LOG_ERROR, "Failed to get local description");
+				cleanupConnection();
+				return;
+			}
+			std::string server_response;
+			try {
+				server_response = sendSDPToServer(static_cast<std::string>(*description));
+			} catch (const std::exception &e) {
+				obs_log(LOG_ERROR, "Failed to send SDP offer to server: %s", e.what());
+				cleanupConnection();
+				return;
+			}
 
-        try {
-            Json::Value response = sendOfferToServer(std::string(desc), serverUrl);
+			// Set remote description from server response.
+			if (server_response.empty()) {
+				obs_log(LOG_ERROR, "Failed to receive SDP answer from server");
+				cleanupConnection();
+				return;
+			}
+			obs_log(LOG_DEBUG, "Received SDP Answer:\n%s", server_response.c_str());
+			json response_json = json::parse(server_response);
+			std::string sdp_answer = response_json["sdp"];
+			pc->setRemoteDescription(rtc::Description(sdp_answer, "answer"));
+			obs_log(LOG_INFO, "WebRTC connection established");
+		}
+	});
 
-            pc->setRemoteDescription(rtc::Description(
-                response["sdp"].asString(),
-                response["type"].asString()
-            ));
+	// Add video channel.
+	const rtc::SSRC ssrc = 42;
+	rtc::Description::Video media("video", rtc::Description::Direction::SendRecv);
+	media.addH264Codec(102);
+	media.addSSRC(ssrc, "video-sendrecv");
+	auto track = pc->addTrack(media);
+	if (!track) {
+		obs_log(LOG_ERROR, "Failed to add video track");
+		cleanupConnection();
+		return;
+	}
+	pc->onTrack([](std::shared_ptr<rtc::Track> track) {
+		obs_log(LOG_DEBUG, "[Track] Added with mid: %s", track->mid().c_str());
+	});
 
-            std::cout << "Remote SDP set successfully\n";
-        } catch (const std::exception& e) {
-            std::cerr << "Error: " << e.what() << "\n";
-        }
-    });
+	// Add control data channel.
+	auto dc = pc->createDataChannel("control");
+	if (!dc) {
+		obs_log(LOG_ERROR, "Failed to create data channel");
+		cleanupConnection();
+		return;
+	}
+	dc->onOpen([]() {
+		obs_log(LOG_DEBUG, "[Data Channel] Opened");
+	});
+	dc->onClosed([&]() { obs_log(LOG_DEBUG, "[Data Channel] Closed"); });
+	dc->onError([](std::string error) { obs_log(LOG_ERROR, "[Data Channel] Error: %s", error.c_str()); });
+	dc->onMessage([](auto data) {
+		if (std::holds_alternative<std::string>(data)) {
+			obs_log(LOG_DEBUG, "[Data Channel] Received: %s", std::get<std::string>(data).c_str());
+		}
+	});
 
-    // Monitor ICE candidate gathering
-    pc->onLocalCandidate([](const rtc::Candidate& candidate) {
-        std::cout << "Local ICE candidate gathered: " << candidate.candidate() << "\n";
-    });
-
-    // Monitor ICE state changes
-    pc->onIceStateChange([](rtc::PeerConnection::IceState state) {
-        std::cout << "ICE state changed: " << static_cast<int>(state) << "\n";
-    });
-
-    // Corrected Local Description Setting
-    pc->setLocalDescription(rtc::Description::Type::Offer);
-    std::cout << "Local description set successfully\n";
-
-    std::cout << "Waiting for WebRTC connection...\n";
+	obs_log(LOG_INFO, "ComfyStream client initialized");
 }
 
-
-// Destructor
-ComfyStreamClient::~ComfyStreamClient() {
-    // Cleanup logic
+/**
+ * ComfyStream client destructor.
+ */
+ComfyStreamClient::~ComfyStreamClient()
+{
+	cleanupConnection();
+	obs_log(LOG_DEBUG, "ComfyStream client destroyed");
 }
 
-// Sending and Receiving Frames (to be implemented)
-void ComfyStreamClient::send_frame(obs_source_frame* /*frame*/) {
-    // Convert OBS frame to WebRTC frame and send
+/**
+ * Send an OBS frame to the ComfyStream server.
+ * 
+ * @param frame The OBS frame to send.
+ */
+void ComfyStreamClient::send_frame(obs_source_frame * /*frame*/)
+{
+	// TODO: Implement frame sending.
 }
 
-obs_source_frame* ComfyStreamClient::receive_frame() {
-    return nullptr;
+/**
+ * Receive a frame from the ComfyStream server.
+ * 
+ * @return The received OBS frame.
+ */
+obs_source_frame *ComfyStreamClient::receive_frame()
+{	
+	// TODO: Implement frame receiving.
+	return nullptr;
 }

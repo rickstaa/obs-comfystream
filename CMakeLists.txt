@@ -15,8 +15,9 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
 find_package(LibDataChannel REQUIRED)
-find_package(jsoncpp REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs LibDataChannel::LibDataChannel jsoncpp_lib)
+find_package(nlohmann_json 3.2.0 REQUIRED)
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs LibDataChannel::LibDataChannel nlohmann_json::nlohmann_json)
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
